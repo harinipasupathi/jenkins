@@ -1,0 +1,197 @@
+pipeline {
+    agent any
+
+    environment {
+        SONARQUBE_SERVER = 'SonarQube-Local'
+        DOCKER_IMAGE_FRONTEND = "harinipasupathi/react-java-frontend"
+        DOCKER_IMAGE_BACKEND = "harinipasupathi/react-java-backend"
+        DOCKER_REGISTRY_CREDENTIALS = 'dockerhub-creds'
+
+        DOCKER_HOST = 'tcp://your.deploy.server.com:2376'
+        DOCKER_TLS_VERIFY = '1'
+        DOCKER_CERT_PATH = '/path/to/docker/certs'
+
+        NODE_OPTIONS = '--max-old-space-size=8192'
+    }
+
+    tools {
+        jdk 'jdk17'
+        maven 'maven3'
+        nodejs 'node18'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code from GitHub...'
+                git url: 'https://github.com/harinipasupathi/react-java-project.git', branch: 'master'
+            }
+        }
+
+        stage('Build Frontend & Backend') {
+            parallel {
+                stage('Build Frontend') {
+                    steps {
+                        script {
+                            def nodeHome = tool name: 'node18', type: 'jenkins.plugins.nodejs.tools.NodeJSInstallation'
+                            env.PATH = "${nodeHome}/bin:${env.PATH}"
+
+                            sh '''
+                                pwd
+                                ls -la
+                                test -f package.json || { echo "package.json missing. Aborting."; exit 1; }
+                                test -f src/setupTests.js && echo "setupTests.js found" || echo "setupTests.js missing!"
+                            '''
+
+                            try {
+                                unstash 'node_modules_cache'
+                                echo "Restored node_modules cache"
+                            } catch (err) {
+                                echo "No cache found, will run npm ci"
+                            }
+
+                            sh '''
+                                npm ci || { echo "npm ci failed."; [ -f npm-debug.log ] && cat npm-debug.log || echo "No npm-debug.log found."; exit 1; }
+                            '''
+
+                            sh '''
+                                if [ -d node_modules ]; then
+                                    echo "node_modules directory exists:"
+                                    ls -la node_modules
+                                else
+                                    echo "node_modules directory missing after npm ci!"
+                                    exit 1
+                                fi
+                            '''
+
+                            stash includes: 'node_modules/**', name: 'node_modules_cache'
+
+                            timeout(time: 60, unit: 'MINUTES') {
+                                sh '''
+                                    (while true; do echo "[HEARTBEAT] Frontend build in progress..."; sleep 60; done) &
+                                    HEARTBEAT_PID=$!
+                                    npm run build
+                                    BUILD_STATUS=$?
+                                    kill $HEARTBEAT_PID
+                                    exit $BUILD_STATUS
+                                '''
+                                sh 'npx jest --ci --reporters=jest-junit --outputFile=jest-junit.xml'
+                            }
+                        }
+                    }
+                }
+
+                stage('Build & Test Backend') {
+                    steps {
+                        dir('backend') {
+                            echo 'Building and testing backend with Maven...'
+                            sh 'mvn clean verify'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('SonarQube Scan (Backend)') {
+            steps {
+                dir('backend') {
+                    withSonarQubeEnv('SonarQube-Local') {
+                        withCredentials([string(credentialsId: 'sonar-taken', variable: 'SONAR_TOKEN')]) {
+                            sh "mvn sonar:sonar -Dsonar.login=${SONAR_TOKEN} -Dsonar.host.url=http://sonarqube:9000 -Dsonar.qualitygate.wait=true"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Archive Artifacts and Test Reports') {
+            steps {
+                dir('backend') {
+                    sh 'ls -la target/surefire-reports || echo "No surefire reports found."'
+                }
+                sh 'ls -la jest-junit.xml || echo "jest-junit.xml not found."'
+
+                archiveArtifacts artifacts: 'backend/target/*.jar', fingerprint: true
+                archiveArtifacts artifacts: 'build/**', fingerprint: true
+
+                script {
+                    if (fileExists('backend/target/surefire-reports')) {
+                        junit 'backend/target/surefire-reports/*.xml'
+                    } else {
+                        echo "No backend test reports found to archive."
+                    }
+
+                    if (fileExists('jest-junit.xml')) {
+                        junit 'jest-junit.xml'
+                    } else {
+                        echo "No frontend test reports found to archive."
+                    }
+                }
+            }
+        }
+
+        stage('Build Docker Images') {
+            steps {
+                script {
+                    sh "docker build -t ${DOCKER_IMAGE_FRONTEND}:${env.BUILD_NUMBER} ."
+                    sh "docker build -t ${DOCKER_IMAGE_BACKEND}:${env.BUILD_NUMBER} ./backend"
+                }
+            }
+        }
+
+        stage('Push Docker Images') {
+            steps {
+                script {
+                    sh """
+                        echo "Logging into DockerHub..."
+                        docker login -u $DOCKERHUB_USERNAME -p $DOCKERHUB_PASSWORD
+
+                        echo "Pushing frontend image..."
+                        docker push ${DOCKER_IMAGE_FRONTEND}:${env.BUILD_NUMBER}
+                        docker tag ${DOCKER_IMAGE_FRONTEND}:${env.BUILD_NUMBER} ${DOCKER_IMAGE_FRONTEND}:latest
+                        docker push ${DOCKER_IMAGE_FRONTEND}:latest
+
+                        echo "Pushing backend image..."
+                        docker push ${DOCKER_IMAGE_BACKEND}:${env.BUILD_NUMBER}
+                        docker tag ${DOCKER_IMAGE_BACKEND}:${env.BUILD_NUMBER} ${DOCKER_IMAGE_BACKEND}:latest
+                        docker push ${DOCKER_IMAGE_BACKEND}:latest
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Remote Docker Host') {
+            steps {
+                withEnv([
+                    "DOCKER_HOST=${env.DOCKER_HOST}",
+                    "DOCKER_TLS_VERIFY=${env.DOCKER_TLS_VERIFY}",
+                    "DOCKER_CERT_PATH=${env.DOCKER_CERT_PATH}"
+                ]) {
+                    script {
+                        sh '''
+                            docker stop backend-container || true
+                            docker rm backend-container || true
+                            docker stop frontend-container || true
+                            docker rm frontend-container || true
+
+                            docker run -d --name backend-container -p 9090:8080 harinipasupathi/react-java-backend:${BUILD_NUMBER}
+                            docker run -d --name frontend-container -p 80:80 harinipasupathi/react-java-frontend:${BUILD_NUMBER}
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+        failure {
+            echo 'Build failed! Sending notifications...'
+        }
+        success {
+            echo 'Build, scan, push, and deploy completed successfully!'
+        }
+    }
+}
